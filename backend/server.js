@@ -1,92 +1,130 @@
 const express = require('express');
-const multer = require('multer');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
-app.use('/photos', express.static(path.join(__dirname, 'uploads')));
+app.use(express.json({ limit: '5mb' }));
 
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// In-Memory Buffer (Last 30 seconds of frames)
+// 2 FPS * 30 seconds = 60 frames max. Har frame ~50KB = Total 3MB RAM (Safe for Render)
+let frameBuffer = []; 
+let lastHeartbeat = Date.now();
+const DEVICE_NAME = "Vivo I2208 (CCTV)";
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => { cb(null, uploadDir); },
-  filename: (req, file, cb) => {
-    const uniqueName = `photo_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.jpg`;
-    cb(null, uniqueName);
+// 1. Frame Upload Endpoint (Phone se aayega)
+app.post('/upload', (req, res) => {
+  const { frame, timestamp } = req.body;
+  
+  if (frame) {
+    // Buffer me frame add karo
+    frameBuffer.push({ time: Date.now(), data: frame });
+    
+    // Agar buffer 30 seconds se bada ho jaye, purane frames delete karo
+    const cutoff = Date.now() - 30000; 
+    frameBuffer = frameBuffer.filter(f => f.time > cutoff);
+  }
+  res.json({ success: true });
+});
+
+// 2. Heartbeat Endpoint (Phone batayega ki wo zinda hai)
+app.post('/heartbeat', (req, res) => {
+  lastHeartbeat = Date.now();
+  res.json({ success: true });
+});
+
+// 3. Status Endpoint (Dashboard check karega)
+app.get('/api/status', (req, res) => {
+  const isOnline = (Date.now() - lastHeartbeat) < 20000; // 20 sec tak ping na aaye to offline
+  res.json({ 
+    online: isOnline, 
+    deviceName: DEVICE_NAME,
+    lastPing: lastHeartbeat 
+  });
+});
+
+// 4. Live Stream Endpoint (10 Second Delay ke sath)
+app.get('/api/stream', (req, res) => {
+  const delaySec = parseInt(req.query.delay) || 10; // Default 10 sec delay
+  const targetTime = Date.now() - (delaySec * 1000);
+  
+  // Buffer me se wo frame dhundo jo 10 second purana hai
+  const targetFrame = frameBuffer.find(f => f.time <= targetTime) || frameBuffer[0];
+  
+  if (targetFrame) {
+    // Frame ko base64 se image me convert karke bhejo
+    const imgBuffer = Buffer.from(targetFrame.data, 'base64');
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Content-Length': imgBuffer.length,
+      'Cache-Control': 'no-cache'
+    });
+    res.end(imgBuffer);
+  } else {
+    res.status(404).send('No frames available');
   }
 });
 
-const upload = multer({ storage: storage, limits: { fileSize: 10 * 1024 * 1024 } });
-
-app.post('/upload', upload.single('photo'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  res.json({ success: true, filename: req.file.filename, url: `/photos/${req.file.filename}` });
-});
-
-app.get('/api/photos', (req, res) => {
-  if (!fs.existsSync(uploadDir)) return res.json({ photos: [] });
-  const files = fs.readdirSync(uploadDir)
-    .filter(file => file.endsWith('.jpg'))
-    .map(file => {
-      const stats = fs.statSync(path.join(uploadDir, file));
-      return { name: file, url: `/photos/${file}`, size: Math.round(stats.size / 1024), timestamp: stats.mtime };
-    })
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  res.json({ photos: files });
-});
-
+// Dashboard HTML
 app.get('/', (req, res) => {
-  const html = `<!DOCTYPE html><html><head><title>CCTV Dashboard</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Courier New', monospace; background: #9bbc0f; color: #0f380f; padding: 20px; }
-    .header { background: #0f380f; color: #9bbc0f; padding: 20px; text-align: center; border: 4px solid #306230; margin-bottom: 20px; font-size: 24px; font-weight: bold; }
-    .stats { background: #8bac0f; border: 4px solid #0f380f; padding: 15px; margin-bottom: 20px; display: flex; justify-content: space-around; flex-wrap: wrap; gap: 10px; }
-    .stat-box { text-align: center; padding: 10px; }
-    .stat-number { font-size: 32px; font-weight: bold; color: #0f380f; }
-    .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; margin-top: 20px; }
-    .photo-card { background: #8bac0f; border: 4px solid #0f380f; padding: 10px; text-align: center; }
-    .photo-card img { width: 100%; height: 200px; object-fit: cover; border: 2px solid #0f380f; }
-    .photo-info { margin-top: 10px; font-size: 14px; word-break: break-all; }
-    .btn { background: #0f380f; color: #9bbc0f; border: 2px solid #306230; padding: 10px 20px; cursor: pointer; font-family: 'Courier New', monospace; font-weight: bold; margin-top: 10px; display: inline-block; text-decoration: none; }
-    .btn:hover { background: #306230; }
-    .refresh-btn { position: fixed; bottom: 20px; right: 20px; font-size: 18px; padding: 15px 25px; border-radius: 50%; width: 60px; height: 60px; }
-  </style></head><body>
-    <div class="header">📷 CCTV DASHBOARD <br><small>Nokia Style Monitor</small></div>
-    <div class="stats">
-      <div class="stat-box"><div class="stat-number" id="totalPhotos">0</div><div>Total Photos</div></div>
-      <div class="stat-box"><div class="stat-number" id="lastUpdate">--</div><div>Last Update</div></div>
-    </div>
-    <div class="photo-grid" id="photoGrid"></div>
-    <button class="btn refresh-btn" onclick="loadPhotos()">🔄</button>
-    <script>
-      function loadPhotos() {
-        fetch('/api/photos').then(r => r.json()).then(data => {
-          document.getElementById('totalPhotos').textContent = data.photos.length;
-          document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-          const grid = document.getElementById('photoGrid');
-          grid.innerHTML = '';
-          data.photos.forEach(photo => {
-            const card = document.createElement('div');
-            card.className = 'photo-card';
-            card.innerHTML = '<img src="' + photo.url + '" alt="' + photo.name + '"><div class="photo-info">' + photo.name + '<br>' + photo.size + ' KB</div><a href="' + photo.url + '" class="btn" download> DOWNLOAD</a>';
-            grid.appendChild(card);
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Live CCTV Feed</title>
+      <style>
+        body { background: #111; color: #0f0; font-family: monospace; text-align: center; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; background: #222; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
+        .status-dot { height: 15px; width: 15px; border-radius: 50%; display: inline-block; margin-right: 10px; }
+        .online { background: #0f0; box-shadow: 0 0 10px #0f0; }
+        .offline { background: #f00; box-shadow: 0 0 10px #f00; }
+        .feed-container { border: 2px solid #0f0; padding: 10px; display: inline-block; border-radius: 10px; }
+        img { max-width: 100%; height: auto; border-radius: 5px; }
+        .info { margin-top: 10px; font-size: 14px; color: #888; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <div><strong>Device:</strong> <span id="deviceName">Loading...</span></div>
+        <div><span id="statusDot" class="status-dot offline"></span> <span id="statusText">Checking...</span></div>
+      </div>
+      
+      <div class="feed-container">
+        <h2>🔴 LIVE FEED (10s Delay)</h2>
+        <img id="liveFeed" src="/api/stream?delay=10" alt="Live Feed" />
+        <div class="info">Buffer Delay: 10 Seconds | Refresh: 500ms</div>
+      </div>
+
+      <script>
+        // Feed ko har 500ms me refresh karo (2 FPS)
+        setInterval(() => {
+          const img = document.getElementById('liveFeed');
+          img.src = '/api/stream?delay=10&t=' + new Date().getTime();
+        }, 500);
+
+        // Status check karo har 5 second me
+        function checkStatus() {
+          fetch('/api/status').then(r => r.json()).then(data => {
+            document.getElementById('deviceName').innerText = data.deviceName;
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            if (data.online) {
+              dot.className = 'status-dot online';
+              text.innerText = 'ONLINE';
+              text.style.color = '#0f0';
+            } else {
+              dot.className = 'status-dot offline';
+              text.innerText = 'OFFLINE';
+              text.style.color = '#f00';
+            }
           });
-        });
-      }
-      loadPhotos();
-      setInterval(loadPhotos, 30000);
-    </script>
-  </body></html>`;
-  res.send(html);
+        }
+        checkStatus();
+        setInterval(checkStatus, 5000);
+      </script>
+    </body>
+    </html>
+  `);
 });
 
-app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
